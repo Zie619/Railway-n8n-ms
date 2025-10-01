@@ -1,218 +1,375 @@
-// server.js — capture cross-origin ad iframes + network images + bg-images
+/**
+ * Ads Inspector Server — paste & run
+ * - Load a JSON file with shape like your uploaded test.json (url/count/ads[])
+ * - REST API with filters, stats, CSV export, Swagger UI
+ */
+
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
-const { chromium } = require('playwright');
+const helmet = require('helmet');
+const cors = require('cors');
+const morgan = require('morgan');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const swaggerUi = require('swagger-ui-express');
 
-const app = express();
-app.use(express.json({ limit: '2mb' }));
+// ---------- Config ----------
+const PORT = process.env.PORT || 3000;
+const DATA_PATH = process.env.DATA_PATH || path.resolve(__dirname, 'test.json');
+const WATCH_DATA = (process.env.WATCH_DATA ?? '1') !== '0';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function withDeadline(promise, ms, msg='Timed out'){ let t; const to=new Promise((_,rej)=>t=setTimeout(()=>rej(new Error(msg)),ms)); try{ return await Promise.race([promise,to]); } finally{ clearTimeout(t); } }
-
-const AD_HOST_RE = /(doubleclick|googlesyndication|googletagservices|gdoubleclick|adnxs|taboola|outbrain|adsystem|adservice|rubicon|criteo|pubmatic|yieldmo|openx|spotx|moat|zeotap|adform|tremor|innovid|adman|adengine|adserver|ads\.)/i;
-
-app.get('/', (_req, res) => res.send('Playwright scraper OK'));
-
-app.post('/scrape', async (req, res) => {
-  const TOTAL_BUDGET_MS = Math.min(Number(process.env.REPLY_TIMEOUT_MS) || 55000, 110000);
-  const started = Date.now();
-  const remain = () => Math.max(0, TOTAL_BUDGET_MS - (Date.now() - started));
-
-  const {
-    url,
-    waitSelector = null,
-    maxScrolls = 4,           // keep modest to avoid 60s proxy limit
-    scrollDelayMs = 700,
-    adSelector = "[data-ad], .ad, [id*='ad-'], [class*='ad-'], [class*='advert'], [id*='google_ads'], [id^='google_ads'], a[href*='adclick'], [data-testid*='ad'] img, img[src*='ads'], img[data-src*='ads']"
-  } = req.body || {};
-
-  if (!url) return res.status(400).json({ ok: false, error: "Missing 'url' in request body" });
-
-  let browser;
-  const netImages = [];   // from network responses (image/* or ad hosts)
-  const netOther = [];    // any request to ad hosts (e.g., HTML/JS iframes)
-
+// ---------- Util ----------
+const stripWww = (s) => (s || '').replace(/^www\./i, '');
+function hostFromUrl(u) {
   try {
-    browser = await withDeadline(chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
-        '--disable-software-rasterizer',
-      ],
-    }), remain(), 'Browser launch timeout');
+    if (!u) return null;
+    const url = new URL(u);
+    return url.hostname || null;
+  } catch (_) {
+    return null;
+  }
+}
+function shortId(str) {
+  return crypto.createHash('md5').update(String(str || '')).digest('hex').slice(0, 12);
+}
+function isThirdParty(imageHost, pageHost) {
+  if (!imageHost || !pageHost) return null;
+  const ih = stripWww(imageHost).toLowerCase();
+  const ph = stripWww(pageHost).toLowerCase();
+  return !(ih === ph || ih.endsWith('.' + ph) || ph.endsWith('.' + ih));
+}
+function classify(ad) {
+  const h = (ad.image_host || '').toLowerCase();
+  const u = (ad.image_url || '').toLowerCase();
 
-    const context = await withDeadline(browser.newContext({
-      locale: 'he-IL',                       // Ynet is Hebrew; sometimes helps
-      timezoneId: 'Asia/Jerusalem',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1366, height: 900 },
-    }), remain(), 'Context creation timeout');
+  const trackerSignals = [
+    'px.gif', 'pixel', 'collect', 'analytics', 'beacon', 'log', 'viewthrough', 'gen_204',
+    'googleadservices', 'doubleclick', 'clarity.ms', 'chartbeat', 'skimresources',
+    'ad-delivery.net', 'trc.taboola', 'taboola.com', 'ib.adnxs', 'pagead2.googlesyndication'
+  ];
+  const adSignals = [
+    'doubleclick', 'googlesyndication', 'adnxs', 'pubmatic', 'taboola',
+    'vidazoo', 'ad-delivery', 'adsrvr', 'adservice', 'securepubads', 'outbrain', 'criteo'
+  ];
 
-    // NETWORK TAP
-    context.on('response', async (resp) => {
-      try {
-        const req = resp.request();
-        const url = req.url();
-        const ct = resp.headers()['content-type'] || '';
-        const frame = req.frame();
-        const frameUrl = frame?.url() || null;
+  const is1x1 = (ad.width === 1 && ad.height === 1);
+  const hasTrackerHints = is1x1 || trackerSignals.some(s => h.includes(s) || u.includes(s));
+  const hasAdHints = adSignals.some(s => h.includes(s) || u.includes(s));
 
-        if (ct.startsWith('image/')) {
-          netImages.push({ image_url: url, via: 'network:image', referer: req.headers()['referer'] || null, frame_url: frameUrl });
-        } else if (AD_HOST_RE.test(url)) {
-          netOther.push({ url, via: 'network:adhost', referer: req.headers()['referer'] || null, frame_url: frameUrl, content_type: ct || null });
-        }
-      } catch {}
-    });
+  return hasTrackerHints ? 'tracker' : (hasAdHints ? 'ad' : 'asset');
+}
+function safeInt(val, fallback = null) {
+  const n = Number.parseInt(val, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+function countBy(items, pick) {
+  const map = new Map();
+  for (const it of items) {
+    const k = pick(it) ?? 'unknown';
+    map.set(k, (map.get(k) || 0) + 1);
+  }
+  return map;
+}
+function sortDescEntries(map) {
+  return [...map.entries()].sort((a, b) => b[1] - a[1]);
+}
+function toCsv(rows, header) {
+  const esc = (v) => {
+    if (v === null || v === undefined) return '';
+    const s = String(v).replace(/"/g, '""');
+    return /[",\n]/.test(s) ? `"${s}"` : s;
+  };
+  return [header, ...rows.map(r => r.map(esc).join(','))].join('\n');
+}
 
-    const page = await withDeadline(context.newPage(), remain(), 'Page creation timeout');
+// ---------- Data state ----------
+const state = {
+  dataFile: DATA_PATH,
+  pageHost: null,
+  raw: null,
+  ads: [],
+  index: new Map(),
+  lastLoaded: null
+};
 
-    await withDeadline(page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(remain(), 20000) }), remain(), 'Navigation timeout');
+function normalize(raw) {
+  const pageHost = hostFromUrl(raw.url);
+  const ads = (raw.ads || []).map(a => {
+    const image_url = a.image_url || null;
+    const referer = a.referer || null;
+    const frame_url = a.frame_url || null;
 
-    // Let initial JS requests flush
-    await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 8000) }).catch(() => {});
+    const image_host = hostFromUrl(image_url);
+    const referer_host = hostFromUrl(referer);
+    const frame_host = hostFromUrl(frame_url);
 
-    // Gentle scrolling up & down to trigger lazy ads
-    for (let i = 0; i < Number(maxScrolls) || 0; i++) {
-      await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
-      await sleep(Number(scrollDelayMs) || 700);
-      await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 4000) }).catch(() => {});
-      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
-      await sleep(200);
-    }
+    const id = shortId([image_url, referer, frame_url].join('|'));
+    const width = safeInt(a.width, null);
+    const height = safeInt(a.height, null);
 
-    if (waitSelector) {
-      await page.waitForSelector(waitSelector, { timeout: Math.min(remain(), 6000) }).catch(() => {});
-    }
-
-    // 1) TOP-DOM: ad-labeled containers & imgs + CSS background-image
-    const domTopAds = await withDeadline(page.evaluate(async (SEL) => {
-      const seen = new Map();
-      const out = [];
-
-      // direct <img> and containers
-      const nodes = Array.from(document.querySelectorAll(SEL));
-      for (const el of nodes) {
-        const img = el.tagName === 'IMG' ? el : (el.querySelector('img') || null);
-        if (img) {
-          const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-          if (src) {
-            const key = src + '|';
-            if (!seen.has(key)) {
-              seen.set(key, 1);
-              out.push({
-                image_url: src,
-                link_url: (img.closest('a')?.href) || (el.closest('a')?.href) || null,
-                alt: img.getAttribute('alt') || null,
-                width: img.naturalWidth || null,
-                height: img.naturalHeight || null,
-                html: (el.outerHTML || '').slice(0, 2000),
-                via: 'dom:img',
-              });
-            }
-          }
-        }
-        // background-image
-        const cs = el.nodeType === 1 ? getComputedStyle(el) : null;
-        if (cs) {
-          const bg = cs.backgroundImage || '';
-          const m = /url\\(["']?([^"')]+)["']?\\)/i.exec(bg);
-          if (m && m[1]) {
-            const src = m[1];
-            const key = src + '|bg';
-            if (!seen.has(key)) {
-              seen.set(key, 1);
-              out.push({
-                image_url: src,
-                link_url: (el.closest('a')?.href) || null,
-                alt: null,
-                width: null,
-                height: null,
-                html: (el.outerHTML || '').slice(0, 2000),
-                via: 'dom:bg',
-              });
-            }
-          }
-        }
-      }
-      return out;
-    }, adSelector), remain(), 'Top-DOM extraction timeout');
-
-    // 2) IFRAMES: list visible iframes (we can’t pierce cross-origin, but we can record src/rect)
-    const iframeInfo = await withDeadline(page.evaluate(() => {
-      const ifr = Array.from(document.querySelectorAll('iframe'));
-      const out = [];
-      for (const f of ifr) {
-        const r = f.getBoundingClientRect();
-        // only visible-ish iframes with some size
-        if (r.width >= 10 && r.height >= 10) {
-          out.push({
-            iframe_src: f.getAttribute('src') || null,
-            width: Math.round(r.width),
-            height: Math.round(r.height),
-            top: Math.round(r.top + window.scrollY),
-            left: Math.round(r.left + window.scrollX),
-            id: f.id || null,
-            class: f.className || null,
-            via: 'dom:iframe'
-          });
-        }
-      }
-      return out;
-    }), remain(), 'Iframe listing timeout');
-
-    // 3) Merge candidates
-    //    - network images (likely creatives)
-    //    - DOM top-level ads (imgs/bg)
-    //    - attach any adhost network entries for context
-    const adSet = new Map();
-
-    const push = (obj) => {
-      const key = (obj.image_url || obj.iframe_src || obj.url) + '|' + (obj.link_url || '') + '|' + (obj.via || '');
-      if (!adSet.has(key)) adSet.set(key, obj);
+    const base = {
+      id,
+      image_url,
+      image_host,
+      link_url: a.link_url || null,
+      alt: a.alt || null,
+      width,
+      height,
+      via: a.via || null,
+      referer,
+      referer_host,
+      frame_url,
+      frame_host
     };
+    return {
+      ...base,
+      type: classify(base),
+      third_party: isThirdParty(image_host, pageHost)
+    };
+  });
+  return { pageHost, ads };
+}
 
-    domTopAds.forEach(push);
+function reload(forceFile) {
+  if (forceFile) state.dataFile = forceFile;
+  if (!fs.existsSync(state.dataFile)) {
+    console.warn(`[WARN] Data file not found at ${state.dataFile}. Starting with empty dataset.`);
+    state.pageHost = null;
+    state.raw = null;
+    state.ads = [];
+    state.index = new Map();
+    state.lastLoaded = new Date();
+    return;
+  }
+  const json = JSON.parse(fs.readFileSync(state.dataFile, 'utf8'));
+  state.raw = json;
+  const { pageHost, ads } = normalize(json);
+  state.pageHost = pageHost;
+  state.ads = ads;
+  state.index = new Map(ads.map(a => [a.id, a]));
+  state.lastLoaded = new Date();
+  console.log(`[DATA] Loaded ${ads.length} items from ${state.dataFile} (pageHost=${pageHost || 'N/A'})`);
+}
 
-    netImages.forEach(n => {
-      push({
-        image_url: n.image_url,
-        link_url: null,       // unknown from network alone
-        alt: null,
-        width: null,
-        height: null,
-        html: null,
-        via: n.via,
-        referer: n.referer,
-        frame_url: n.frame_url,
-      });
+// initial load
+reload();
+
+// optional auto-reload on file changes
+if (WATCH_DATA && fs.existsSync(state.dataFile)) {
+  try {
+    fs.watchFile(state.dataFile, { interval: 2000 }, (curr, prev) => {
+      if (curr.mtimeMs !== prev.mtimeMs) {
+        console.log('[DATA] Change detected, reloading...');
+        try { reload(); } catch (e) { console.error('Reload failed:', e.message); }
+      }
     });
+  } catch (_) {}
+}
 
-    // keep the ad-host hits too (useful for GPT/analytics and de-dupe)
-    netOther.forEach(n => push({ url: n.url, via: n.via, referer: n.referer, frame_url: n.frame_url }));
+// allow CI sanity check
+if (process.argv.includes('--check')) {
+  console.log(JSON.stringify({
+    ok: true,
+    file: state.dataFile,
+    pageHost: state.pageHost,
+    count: state.ads.length
+  }, null, 2));
+  process.exit(0);
+}
 
-    // visible iframes (just context; many ads live here)
-    iframeInfo.forEach(i => push(i));
+// ---------- App ----------
+const app = express();
+app.set('trust proxy', true);
+app.use(helmet());
+app.use(cors());
+app.use(compression());
+app.use(morgan('dev'));
+app.use(rateLimit({ windowMs: 60_000, max: 120 }));
 
-    const ads = Array.from(adSet.values());
+// Health
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    now: new Date().toISOString(),
+    dataset: {
+      file: state.dataFile,
+      lastLoaded: state.lastLoaded,
+      pageHost: state.pageHost,
+      total: state.ads.length
+    }
+  });
+});
 
-    res.json({
-      ok: true,
-      url,
-      count: ads.length,
-      ads,
-      elapsed_ms: Date.now() - started
+// List ads with filters
+app.get('/ads', (req, res) => {
+  const q = String(req.query.q || '').toLowerCase();
+  const type = req.query.type ? String(req.query.type).toLowerCase() : null; // ad|tracker|asset
+  const host = req.query.host ? String(req.query.host).toLowerCase() : null; // image_host contains
+  const referer = req.query.referer ? String(req.query.referer).toLowerCase() : null; // referer_host contains
+  const frame = req.query.frame ? String(req.query.frame).toLowerCase() : null; // frame_host contains
+  const via = req.query.via ? String(req.query.via).toLowerCase() : null;
+
+  const page = Math.max(1, safeInt(req.query.page, 1));
+  const pageSize = Math.min(1000, Math.max(1, safeInt(req.query.pageSize, 50)));
+
+  const sort = String(req.query.sort || 'type');
+  const order = String(req.query.order || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc';
+  const sortable = new Set(['type','image_host','referer_host','frame_host','third_party','width','height','via','id']);
+
+  let list = state.ads;
+
+  if (type) list = list.filter(a => a.type === type);
+  if (host) list = list.filter(a => (a.image_host || '').toLowerCase().includes(host));
+  if (referer) list = list.filter(a => (a.referer_host || '').toLowerCase().includes(referer));
+  if (frame) list = list.filter(a => (a.frame_host || '').toLowerCase().includes(frame));
+  if (via) list = list.filter(a => (a.via || '').toLowerCase().includes(via));
+  if (q) {
+    list = list.filter(a =>
+      (a.image_url || '').toLowerCase().includes(q) ||
+      (a.referer || '').toLowerCase().includes(q) ||
+      (a.frame_url || '').toLowerCase().includes(q) ||
+      (a.alt || '').toLowerCase().includes(q)
+    );
+  }
+
+  if (sortable.has(sort)) {
+    list = list.slice().sort((a, b) => {
+      const A = a[sort];
+      const B = b[sort];
+      if (A === B) return 0;
+      if (A === undefined || A === null) return 1;
+      if (B === undefined || B === null) return -1;
+      return A > B ? 1 : -1;
     });
+    if (order === 'desc') list.reverse();
+  }
+
+  const total = list.length;
+  const start = (page - 1) * pageSize;
+  const data = list.slice(start, start + pageSize);
+
+  res.json({ page, pageSize, total, data });
+});
+
+// Single ad
+app.get('/ads/:id', (req, res) => {
+  const ad = state.index.get(String(req.params.id));
+  if (!ad) return res.status(404).json({ error: 'Not found' });
+  res.json(ad);
+});
+
+// Stats
+app.get('/ads/stats', (req, res) => {
+  const total = state.ads.length;
+  const byType = Object.fromEntries(countBy(state.ads, a => a.type));
+  const byVia = Object.fromEntries(sortDescEntries(countBy(state.ads, a => a.via)).slice(0, 20));
+  const byImageHost = Object.fromEntries(sortDescEntries(countBy(state.ads, a => a.image_host)).slice(0, 20));
+  const byRefererHost = Object.fromEntries(sortDescEntries(countBy(state.ads, a => a.referer_host)).slice(0, 20));
+  const oneByOne = state.ads.filter(a => a.width === 1 && a.height === 1).length;
+  const thirdParty = state.ads.filter(a => a.third_party === true).length;
+
+  res.json({
+    total,
+    pageHost: state.pageHost,
+    counts: { oneByOne, thirdParty },
+    byType,
+    top: { byVia, byImageHost, byRefererHost }
+  });
+});
+
+// CSV export
+app.get('/export/csv', (req, res) => {
+  const header = [
+    'id','type','third_party','image_url','image_host','via',
+    'referer','referer_host','frame_url','frame_host','width','height'
+  ];
+  const rows = state.ads.map(a => [
+    a.id, a.type, a.third_party, a.image_url, a.image_host, a.via,
+    a.referer, a.referer_host, a.frame_url, a.frame_host, a.width ?? '', a.height ?? ''
+  ]);
+  const csv = toCsv(rows, header.join(','));
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="ads-export.csv"');
+  res.send(csv);
+});
+
+// Admin reload (optional X-Admin-Token)
+app.post('/reload', express.json({ limit: '1mb' }), (req, res) => {
+  if (ADMIN_TOKEN && (req.get('x-admin-token') !== ADMIN_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const newPath = req.body?.path;
+  try {
+    reload(newPath);
+    res.json({ ok: true, file: state.dataFile, total: state.ads.length });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e), elapsed_ms: Date.now() - started });
-  } finally {
-    if (browser) await browser.close();
+    res.status(400).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => console.log('Listening on', PORT));
+// Swagger (minimal OpenAPI)
+const openapi = {
+  openapi: '3.0.0',
+  info: {
+    title: 'Ads Inspector API',
+    version: '1.0.0',
+    description: 'Explore ad/trackers parsed from a crawl JSON'
+  },
+  servers: [{ url: '/' }],
+  paths: {
+    '/health': { get: { summary: 'Health', responses: { '200': { description: 'OK' } } } },
+    '/ads': {
+      get: {
+        summary: 'List ads with filters',
+        parameters: [
+          { name: 'q', in: 'query', schema: { type: 'string' } },
+          { name: 'type', in: 'query', schema: { type: 'string', enum: ['ad','tracker','asset'] } },
+          { name: 'host', in: 'query', schema: { type: 'string' } },
+          { name: 'referer', in: 'query', schema: { type: 'string' } },
+          { name: 'frame', in: 'query', schema: { type: 'string' } },
+          { name: 'via', in: 'query', schema: { type: 'string' } },
+          { name: 'sort', in: 'query', schema: { type: 'string' } },
+          { name: 'order', in: 'query', schema: { type: 'string', enum: ['asc','desc'] } },
+          { name: 'page', in: 'query', schema: { type: 'integer', default: 1 } },
+          { name: 'pageSize', in: 'query', schema: { type: 'integer', default: 50 } }
+        ],
+        responses: { '200': { description: 'OK' } }
+      }
+    },
+    '/ads/{id}': {
+      get: {
+        summary: 'Get a single ad by id',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { '200': { description: 'OK' }, '404': { description: 'Not found' } }
+      }
+    },
+    '/ads/stats': { get: { summary: 'Aggregate stats', responses: { '200': { description: 'OK' } } } },
+    '/export/csv': { get: { summary: 'Download CSV export', responses: { '200': { description: 'CSV' } } } },
+    '/reload': {
+      post: {
+        summary: 'Reload data file (optionally switch path)',
+        requestBody: {
+          content: { 'application/json': { schema: { type: 'object', properties: { path: { type: 'string' } } } } }
+        },
+        responses: { '200': { description: 'OK' }, '401': { description: 'Unauthorized' } }
+      }
+    }
+  }
+};
+app.use('/docs', swaggerUi.serve, swaggerUi.setup(openapi));
+
+// 404 & error handler
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+app.use((err, req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal error' });
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ Ads Inspector listening on http://localhost:${PORT}  (data: ${state.dataFile})`);
+});
