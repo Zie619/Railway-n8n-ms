@@ -1,6 +1,6 @@
 {
   "name": "railway-playwright-scraper",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Tiny Playwright microservice for JS-rendered scraping (Railway-ready).",
   "scripts": {
@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "^1.47.2"
+    "playwright": "1.55.1"
   }
 }
