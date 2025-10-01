@@ -1,18 +1,10 @@
-# Match Playwright version with the npm package (1.55.1)
-FROM mcr.microsoft.com/playwright:v1.55.1-jammy
-
+# Simple container image for the server
+FROM node:20-alpine
 WORKDIR /app
-
-# Install deps first for better caching
-COPY package.json package-lock.json* ./
-# If you don't have a lockfile, this still works:
+COPY package.json ./
 RUN npm install --omit=dev
-
-# Then copy code
 COPY server.js ./
-
-ENV NODE_ENV=production
-EXPOSE 8080
-
-# Railway sets PORT (often 8080). server.js reads it.
+# Default env; mount your JSON to /data/test.json or set DATA_PATH at run-time
+ENV PORT=3000 DATA_PATH=/data/test.json WATCH_DATA=1
+EXPOSE 3000
 CMD ["node", "server.js"]
