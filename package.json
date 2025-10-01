@@ -1,24 +1,18 @@
 {
-  "name": "ads-inspector-server",
-  "version": "1.0.0",
-  "description": "Tiny API to explore ad/trackers from a crawl JSON",
-  "main": "server.js",
+  "name": "railway-playwright-scraper",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Playwright microservice + image analysis for Ynet ads",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js --watch",
-    "check": "node server.js --check"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node server.js"
   },
   "dependencies": {
-    "compression": "*",
-    "cors": "*",
-    "dotenv": "*",
-    "express": "*",
-    "express-rate-limit": "*",
-    "helmet": "*",
-    "morgan": "*",
-    "swagger-ui-express": "*"
+    "archiver": "^7.0.1",
+    "axios": "^1.7.2",
+    "canvas": "^2.11.2",
+    "express": "^4.19.2",
+    "playwright": "1.55.1",
+    "sharp": "^0.33.3",
+    "tesseract.js": "^5.1.1"
   }
 }
