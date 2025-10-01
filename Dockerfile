@@ -1,17 +1,18 @@
-# Use the official Playwright image (Chromium already installed)
-FROM mcr.microsoft.com/playwright:v1.47.2-jammy
+# Match Playwright version with the npm package (1.55.1)
+FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 
 WORKDIR /app
 
 # Install deps first for better caching
-COPY package.json ./
+COPY package.json package-lock.json* ./
+# If you don't have a lockfile, this still works:
 RUN npm install --omit=dev
 
-# Then copy the app code
+# Then copy code
 COPY server.js ./
 
 ENV NODE_ENV=production
-EXPOSE 3000
+EXPOSE 8080
 
-# Railway injects PORT; server.js reads it
+# Railway sets PORT (often 8080). server.js reads it.
 CMD ["node", "server.js"]
