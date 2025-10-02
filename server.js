@@ -11,7 +11,7 @@ const { imageSize } = require('image-size');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
-
+app.use(express.urlencoded({ extended: true }));
 // ---------- constants ----------
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -209,19 +209,28 @@ async function scrapeOnce({ url, budgetMs = 15000, maxScrolls = 4, scrollDelayMs
 }
 
 // ---------- HTTP API ----------
+
+// helper to coerce to finite number with default
+function num(x, d) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
+
+
 app.post('/scrape', async (req, res) => {
-  const {
-    url,
-    maxScrolls = 4,
-    scrollDelayMs = 600,
-    budgetMs = 15000,
-  } = req.body || {};
-
-  if (!url || !/^https?:\/\//i.test(url)) {
-    return res.status(400).json({ error: 'Body must include a valid { url }' });
-  }
-
   try {
+    // body may contain strings from n8n — coerce everything
+    const raw = req.body || {};
+    const url = raw.url;
+
+    if (!url || !/^https?:\/\//i.test(url)) {
+      return res.status(400).json({ error: 'Body must include a valid { url }' });
+    }
+
+    const maxScrolls   = num(raw.maxScrolls, 4);
+    const scrollDelayMs = num(raw.scrollDelayMs, 600);
+    const budgetMs     = num(raw.budgetMs, 15000);
+
     const ads = await scrapeOnce({ url, maxScrolls, scrollDelayMs, budgetMs });
     return res.json({ ads, source: 'playwright', page_url: url });
   } catch (e) {
