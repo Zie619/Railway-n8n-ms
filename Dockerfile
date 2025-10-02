@@ -5,8 +5,8 @@ WORKDIR /app
 
 # Install deps first for better caching
 COPY package.json package-lock.json* ./
-# If you don't have a lockfile, this still works:
-RUN npm install --omit=dev
+RUN npm install --omit=dev \
+ && npm install image-size --omit=dev
 
 # Then copy code
 COPY server.js ./
