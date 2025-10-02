@@ -1,218 +1,191 @@
-// server.js — capture cross-origin ad iframes + network images + bg-images
+// server.js — Playwright-based ad-image scraper focused on simgad (Google) + Taboola images
+// Captures only image/* responses from tpc.googlesyndication.com/simgad and *images.taboola.com
+// 15s budget per page; returns unique creatives with basic metadata.
+
 const express = require('express');
 const { chromium } = require('playwright');
-
+const { imageSize } = require('image-size'); // npm i image-size
 const app = express();
+
 app.use(express.json({ limit: '2mb' }));
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function withDeadline(promise, ms, msg='Timed out'){ let t; const to=new Promise((_,rej)=>t=setTimeout(()=>rej(new Error(msg)),ms)); try{ return await Promise.race([promise,to]); } finally{ clearTimeout(t); } }
+// ---------- helpers ----------
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-const AD_HOST_RE = /(doubleclick|googlesyndication|googletagservices|gdoubleclick|adnxs|taboola|outbrain|adsystem|adservice|rubicon|criteo|pubmatic|yieldmo|openx|spotx|moat|zeotap|adform|tremor|innovid|adman|adengine|adserver|ads\.)/i;
+function uniqBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    const k = keyFn(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
 
-app.get('/', (_req, res) => res.send('Playwright scraper OK'));
+function isAllowedAdImage(url, contentType) {
+  if (!url || !url.startsWith('http')) return false;
+  const ct = (contentType || '').toLowerCase();
 
+  // Must be image/* (jpeg/png/webp/gif/avif)
+  const isImageCT = ct.startsWith('image/');
+  const looksImageExt = /\.(png|jpe?g|webp|gif|avif)(?:[?#].*|$)/i.test(url);
+
+  // Sources we want:
+  // 1) Google display image CDN: .../simgad/...
+  const isGoogleSimgad =
+    /(^|\/\/)tpc\.googlesyndication\.com\/simgad\//i.test(url);
+  // 2) Taboola images CDN (some deployments use images.taboola.com / img.taboola.com)
+  const isTaboolaImg =
+    /(^|\/\/)(images|img)\.taboola\.com\//i.test(url);
+
+  // Only pass if it’s one of our target hosts and looks like an image
+  const fromAllowedHost = isGoogleSimgad || isTaboolaImg;
+
+  return fromAllowedHost && (isImageCT || looksImageExt);
+}
+
+function withinSize(w, h, min = 30) {
+  // filter out tracking pixels/super small assets
+  if (w != null && h != null) {
+    return w >= min && h >= min;
+  }
+  // unknown sizes are allowed (we'll try to compute from buffer), let later logic decide
+  return true;
+}
+
+// ---------- core scrape ----------
+async function scrapeOnce({ url, budgetMs = 15000, maxScrolls = 4, scrollDelayMs = 600 }) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    userAgent: UA,
+    viewport: { width: 1366, height: 900 },
+    javaScriptEnabled: true,
+    bypassCSP: true,
+    // Accept headers tuned for images (helps some CDNs)
+    extraHTTPHeaders: {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.8',
+      'Cache-Control': 'max-age=0',
+      'Upgrade-Insecure-Requests': '1',
+    },
+  });
+
+  const page = await context.newPage();
+  const startedAt = Date.now();
+
+  const found = new Map(); // key: image_url → ad record
+
+  // Listen to all network responses and pick the ad images we care about
+  page.on('response', async (resp) => {
+    try {
+      const respUrl = resp.url();
+      const headers = resp.headers();
+      const ct = (headers['content-type'] || '').toLowerCase();
+
+      if (!isAllowedAdImage(respUrl, ct)) return;
+
+      // Pull some metadata
+      const req = resp.request();
+      const frame = req.frame();
+      const referer = req.headers()['referer'] || null;
+      const frameUrl = frame?.url() || null;
+
+      // Read bytes to try to compute width/height
+      let width = null, height = null;
+      try {
+        const buf = await resp.body();
+        if (buf && buf.length >= 1024) {
+          const dim = imageSize(buf);
+          width = Number(dim?.width) || null;
+          height = Number(dim?.height) || null;
+        }
+      } catch {
+        // swallow dimension errors; leave as null
+      }
+
+      // quick small filter (if we actually measured)
+      if (!withinSize(width, height, 30)) return;
+
+      const rec = {
+        image_url: respUrl,
+        link_url: null,
+        alt: '',
+        width,
+        height,
+        html: null,
+        via: 'network:image',
+        referer,
+        frame_url: frameUrl,
+        placement_hint: null,
+      };
+
+      found.set(respUrl, rec);
+    } catch {
+      // ignore a single bad response
+    }
+  });
+
+  // Go to page and wait a bit for networks
+  await page.route('**/*', (route) => {
+    // light politeness: block heavy video if needed (optional)
+    // if (route.request().resourceType() === 'media') return route.abort();
+    route.continue();
+  });
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+  // Trigger lazy loads (limited scrolls within budget)
+  for (let i = 0; i < Math.max(0, maxScrolls); i++) {
+    if (Date.now() - startedAt > budgetMs) break;
+    await page.mouse.wheel(0, 1200);
+    await page.waitForTimeout(scrollDelayMs);
+  }
+
+  // Let network settle but respect 15s budget
+  const remaining = Math.max(0, budgetMs - (Date.now() - startedAt));
+  if (remaining > 0) {
+    // networkidle can hang; race with timeout
+    await Promise.race([
+      page.waitForLoadState('networkidle').catch(() => {}),
+      page.waitForTimeout(Math.min(remaining, 4000)),
+    ]);
+  }
+
+  const ads = uniqBy(Array.from(found.values()), x => x.image_url);
+
+  await context.close();
+  await browser.close();
+
+  return ads;
+}
+
+// ---------- HTTP API ----------
 app.post('/scrape', async (req, res) => {
-  const TOTAL_BUDGET_MS = Math.min(Number(process.env.REPLY_TIMEOUT_MS) || 55000, 110000);
-  const started = Date.now();
-  const remain = () => Math.max(0, TOTAL_BUDGET_MS - (Date.now() - started));
-
   const {
     url,
-    waitSelector = null,
-    maxScrolls = 4,           // keep modest to avoid 60s proxy limit
-    scrollDelayMs = 700,
-    adSelector = "[data-ad], .ad, [id*='ad-'], [class*='ad-'], [class*='advert'], [id*='google_ads'], [id^='google_ads'], a[href*='adclick'], [data-testid*='ad'] img, img[src*='ads'], img[data-src*='ads']"
+    maxScrolls = 4,
+    scrollDelayMs = 600,
+    budgetMs = 15000,
   } = req.body || {};
 
-  if (!url) return res.status(400).json({ ok: false, error: "Missing 'url' in request body" });
-
-  let browser;
-  const netImages = [];   // from network responses (image/* or ad hosts)
-  const netOther = [];    // any request to ad hosts (e.g., HTML/JS iframes)
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: 'Body must include a valid { url }' });
+  }
 
   try {
-    browser = await withDeadline(chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-zygote',
-        '--single-process',
-        '--disable-software-rasterizer',
-      ],
-    }), remain(), 'Browser launch timeout');
-
-    const context = await withDeadline(browser.newContext({
-      locale: 'he-IL',                       // Ynet is Hebrew; sometimes helps
-      timezoneId: 'Asia/Jerusalem',
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1366, height: 900 },
-    }), remain(), 'Context creation timeout');
-
-    // NETWORK TAP
-    context.on('response', async (resp) => {
-      try {
-        const req = resp.request();
-        const url = req.url();
-        const ct = resp.headers()['content-type'] || '';
-        const frame = req.frame();
-        const frameUrl = frame?.url() || null;
-
-        if (ct.startsWith('image/')) {
-          netImages.push({ image_url: url, via: 'network:image', referer: req.headers()['referer'] || null, frame_url: frameUrl });
-        } else if (AD_HOST_RE.test(url)) {
-          netOther.push({ url, via: 'network:adhost', referer: req.headers()['referer'] || null, frame_url: frameUrl, content_type: ct || null });
-        }
-      } catch {}
-    });
-
-    const page = await withDeadline(context.newPage(), remain(), 'Page creation timeout');
-
-    await withDeadline(page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.min(remain(), 20000) }), remain(), 'Navigation timeout');
-
-    // Let initial JS requests flush
-    await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 8000) }).catch(() => {});
-
-    // Gentle scrolling up & down to trigger lazy ads
-    for (let i = 0; i < Number(maxScrolls) || 0; i++) {
-      await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
-      await sleep(Number(scrollDelayMs) || 700);
-      await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 4000) }).catch(() => {});
-      await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'instant' }));
-      await sleep(200);
-    }
-
-    if (waitSelector) {
-      await page.waitForSelector(waitSelector, { timeout: Math.min(remain(), 6000) }).catch(() => {});
-    }
-
-    // 1) TOP-DOM: ad-labeled containers & imgs + CSS background-image
-    const domTopAds = await withDeadline(page.evaluate(async (SEL) => {
-      const seen = new Map();
-      const out = [];
-
-      // direct <img> and containers
-      const nodes = Array.from(document.querySelectorAll(SEL));
-      for (const el of nodes) {
-        const img = el.tagName === 'IMG' ? el : (el.querySelector('img') || null);
-        if (img) {
-          const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-          if (src) {
-            const key = src + '|';
-            if (!seen.has(key)) {
-              seen.set(key, 1);
-              out.push({
-                image_url: src,
-                link_url: (img.closest('a')?.href) || (el.closest('a')?.href) || null,
-                alt: img.getAttribute('alt') || null,
-                width: img.naturalWidth || null,
-                height: img.naturalHeight || null,
-                html: (el.outerHTML || '').slice(0, 2000),
-                via: 'dom:img',
-              });
-            }
-          }
-        }
-        // background-image
-        const cs = el.nodeType === 1 ? getComputedStyle(el) : null;
-        if (cs) {
-          const bg = cs.backgroundImage || '';
-          const m = /url\\(["']?([^"')]+)["']?\\)/i.exec(bg);
-          if (m && m[1]) {
-            const src = m[1];
-            const key = src + '|bg';
-            if (!seen.has(key)) {
-              seen.set(key, 1);
-              out.push({
-                image_url: src,
-                link_url: (el.closest('a')?.href) || null,
-                alt: null,
-                width: null,
-                height: null,
-                html: (el.outerHTML || '').slice(0, 2000),
-                via: 'dom:bg',
-              });
-            }
-          }
-        }
-      }
-      return out;
-    }, adSelector), remain(), 'Top-DOM extraction timeout');
-
-    // 2) IFRAMES: list visible iframes (we can’t pierce cross-origin, but we can record src/rect)
-    const iframeInfo = await withDeadline(page.evaluate(() => {
-      const ifr = Array.from(document.querySelectorAll('iframe'));
-      const out = [];
-      for (const f of ifr) {
-        const r = f.getBoundingClientRect();
-        // only visible-ish iframes with some size
-        if (r.width >= 10 && r.height >= 10) {
-          out.push({
-            iframe_src: f.getAttribute('src') || null,
-            width: Math.round(r.width),
-            height: Math.round(r.height),
-            top: Math.round(r.top + window.scrollY),
-            left: Math.round(r.left + window.scrollX),
-            id: f.id || null,
-            class: f.className || null,
-            via: 'dom:iframe'
-          });
-        }
-      }
-      return out;
-    }), remain(), 'Iframe listing timeout');
-
-    // 3) Merge candidates
-    //    - network images (likely creatives)
-    //    - DOM top-level ads (imgs/bg)
-    //    - attach any adhost network entries for context
-    const adSet = new Map();
-
-    const push = (obj) => {
-      const key = (obj.image_url || obj.iframe_src || obj.url) + '|' + (obj.link_url || '') + '|' + (obj.via || '');
-      if (!adSet.has(key)) adSet.set(key, obj);
-    };
-
-    domTopAds.forEach(push);
-
-    netImages.forEach(n => {
-      push({
-        image_url: n.image_url,
-        link_url: null,       // unknown from network alone
-        alt: null,
-        width: null,
-        height: null,
-        html: null,
-        via: n.via,
-        referer: n.referer,
-        frame_url: n.frame_url,
-      });
-    });
-
-    // keep the ad-host hits too (useful for GPT/analytics and de-dupe)
-    netOther.forEach(n => push({ url: n.url, via: n.via, referer: n.referer, frame_url: n.frame_url }));
-
-    // visible iframes (just context; many ads live here)
-    iframeInfo.forEach(i => push(i));
-
-    const ads = Array.from(adSet.values());
-
-    res.json({
-      ok: true,
-      url,
-      count: ads.length,
-      ads,
-      elapsed_ms: Date.now() - started
-    });
+    const ads = await scrapeOnce({ url, maxScrolls, scrollDelayMs, budgetMs });
+    return res.json({ ads, source: 'playwright', page_url: url });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e), elapsed_ms: Date.now() - started });
-  } finally {
-    if (browser) await browser.close();
+    console.error('SCRAPE_ERROR', e?.message);
+    return res.status(500).json({ error: 'scrape failed', detail: String(e?.message || e) });
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => console.log('Listening on', PORT));
+app.get('/', (_req, res) => res.json({ ok: true, name: 'ad-image-scraper', ts: new Date().toISOString() }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('[ad-scraper] listening on', PORT));
